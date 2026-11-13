@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Game of Life 3D</title>
+<style>
+  :root { --bg:#0b0e14; --panel:#141923ee; --fg:#d8dee9; --dim:#8892a6; --acc:#4fd1c5; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:13px/1.4 system-ui, sans-serif; overflow:hidden; }
+  #panel { position:fixed; top:12px; left:12px; width:260px; max-height:calc(100% - 24px); overflow:auto;
+    background:var(--panel); border:1px solid #2a3142; border-radius:10px; padding:12px; backdrop-filter: blur(6px); }
+  h1 { font-size:15px; margin:0 0 8px; }
+  label { display:block; margin:8px 0 2px; color:var(--dim); }
+  .row { display:flex; gap:6px; align-items:center; }
+  .row > * { flex:1; }
+  button, select, input[type=text] { background:#1d2433; color:var(--fg); border:1px solid #2f3850; border-radius:6px; padding:6px 8px; font:inherit; width:100%; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); color:#06201d; border-color:var(--acc); font-weight:600; }
+  input[type=range] { width:100%; accent-color:var(--acc); }
+  .stats { margin-top:10px; padding-top:8px; border-top:1px solid #2a3142; color:var(--dim); font-variant-numeric: tabular-nums; }
+  .stats b { color:var(--fg); }
+  .hint { color:var(--dim); font-size:11px; margin-top:8px; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>Game of Life 3D</h1>
+  <div class="row">
+    <button id="play" class="primary">▶ Play</button>
+    <button id="step">Paso</button>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <button id="random">Aleatorio</button>
+    <button id="clear">Limpiar</button>
+  </div>
+
+  <label>Preset de reglas</label>
+  <select id="preset"></select>
+  <label>Sobrevive (vecinos de 26)</label>
+  <input type="text" id="survive" value="4,5">
+  <label>Nace (vecinos de 26)</label>
+  <input type="text" id="birth" value="5">
+
+  <label>Tamaño del cubo: <span id="sizeV">28</span></label>
+  <input type="range" id="size" min="8" max="64" value="28">
+  <label>Densidad inicial: <span id="densV">12</span>%</label>
+  <input type="range" id="dens" min="1" max="60" value="12">
+  <label>Región inicial: <span id="regV">50</span>%</label>
+  <input type="range" id="reg" min="10" max="100" value="50">
+  <label>Velocidad: <span id="speedV">8</span> gen/s</label>
+  <input type="range" id="speed" min="1" max="30" value="8">
+
+  <label>Color</label>
+  <select id="color">
+    <option value="age">Por edad</option>
+    <option value="pos">Por posición</option>
+    <option value="neigh">Por vecinos</option>
+  </select>
+  <label><input type="checkbox" id="wrap" checked> Mundo toroidal (bordes conectados)</label>
+  <label><input type="checkbox" id="rotate" checked> Rotación automática</label>
+  <label><input type="checkbox" id="slice"> Corte (ver interior)</label>
+  <input type="range" id="sliceY" min="0" max="64" value="64" disabled>
+
+  <div class="stats">
+    Generación: <b id="gen">0</b><br>
+    Población: <b id="pop">0</b><br>
+    Estado: <b id="state">—</b>
+  </div>
+  <div class="hint">Arrastra para orbitar · rueda para zoom · clic derecho para mover.<br>Reglas: lista de números/rangos, ej. <code>13-14,17-19</code>.<br>Atajos: espacio = play/pausa, S = paso, R = aleatorio.</div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = id => document.getElementById(id);
+
+// ---------- Presets (B/S en vecindad de Moore 3D, 26 vecinos) ----------
+const PRESETS = {
+  'Bays 4555 (S4-5 / B5)':        { s:'4,5',            b:'5',                d:12, r:50 },
+  'Bays 5766 (S5-7 / B6)':        { s:'5-7',            b:'6',                d:15, r:50 },
+  'Pyroclastic (S4-7 / B6-8)':    { s:'4-7',            b:'6-8',              d:10, r:40 },
+  'Nubes (S13-26 / B13-14,17-19)':{ s:'13-26',          b:'13-14,17-19',      d:40, r:60 },
+  'Ameba (S9-26 / B5-7,12-13,15)':{ s:'9-26',           b:'5-7,12-13,15',     d:35, r:60 },
+  'Cristales (S5-7 / B6-7)':      { s:'5-7',            b:'6-7',              d:12, r:40 },
+  'Coral (S5-8 / B6-7,9,12)':     { s:'5-8',            b:'6-7,9,12',         d:18, r:50 },
+  'Personalizado':                null,
+};
+for (const k of Object.keys(PRESETS)) $('preset').add(new Option(k, k));
+
+function parseRule(str) {
+  const out = new Uint8Array(27);
+  for (const part of str.split(',')) {
+    const t = part.trim(); if (!t) continue;
+    const m = t.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (m) { for (let i = +m[1]; i <= Math.min(26, +m[2]); i++) out[i] = 1; }
+    else if (/^\d+$/.test(t) && +t <= 26) out[+t] = 1;
+  }
+  return out;
+}
+
+// ---------- Estado ----------
+let N = 28, cur, nxt, age, neighCount;
+let surviveR = parseRule('4,5'), birthR = parseRule('5');
+let gen = 0, running = false, acc = 0, wrap = true;
+let prevPop = [],
+
+stateText = '—';
+
+function alloc() {
+  const n = N * N * N;
+  cur = new Uint8Array(n); nxt = new Uint8Array(n);
+  age = new Uint16Array(n); neighCount = new Uint8Array(n);
+  buildMesh(); buildBox();
+}
+const idx = (x, y, z) => x + N * (y + N * z);
+
+function step() {
+  const n = N;
+  let pop = 0;
+  for (let z = 0; z < n; z++) for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    let c = 0;
+    for (let dz = -1; dz <= 1; dz++) {
+      let zz = z + dz;
+      if (zz < 0 || zz >= n) { if (!wrap) continue; zz = (zz + n) % n; }
+      for (let dy = -1; dy <= 1; dy++) {
+        let yy = y + dy;
+        if (yy < 0 || yy >= n) { if (!wrap) continue; yy = (yy + n) % n; }
+        for (let dx = -1; dx <= 1; dx++) {
+          if (!dx && !dy && !dz) continue;
+          let xx = x + dx;
+          if (xx < 0 || xx >= n) { if (!wrap) continue; xx = (xx + n) % n; }
+          c += cur[xx + n * (yy + n * zz)];
+        }
+      }
+    }
+    const i = x + n * (y + n * z);
+    const alive = cur[i] ? surviveR[c] : birthR[c];
+    nxt[i] = alive;
+    neighCount[i] = c;
+    age[i] = alive ? (cur[i] ? Math.min(age[i] + 1, 65535) : 1) : 0;
+    pop += alive;
+  }
+  [cur, nxt] = [nxt, cur];
+  gen++;
+  detectState(pop);
+  render(pop);
+}
+
+function detectState(pop) {
+  prevPop.push(pop); if (prevPop.length > 12) prevPop.shift();
+  const l = prevPop;
+  if (pop === 0) { stateText = 'Extinto'; if (running) setRunning(false); }
+  else if (l.length >= 8 && l.slice(-8).every(v => v === pop)) stateText = 'Estable / oscilando';
+  else stateText = 'Evolucionando';
+}
+
+function randomize() {
+  cur.fill(0); age.fill(0); gen = 0; prevPop = [];
+  const dens = +$('dens').value / 100, reg = +$('reg').value / 100;
+  const half = Math.max(1, Math.round(N * reg / 2)), c = N / 2;
+  const lo = Math.max(0, Math.floor(c - half)), hi = Math.min(N, Math.ceil(c + half));
+  for (let z = lo; z < hi; z++) for (let y = lo; y < hi; y++) for (let x = lo; x < hi; x++)
+    if (Math.random() < dens) { const i = idx(x, y, z); cur[i] = 1; age[i] = 1; }
+  neighCount.fill(0);
+  stateText = 'Evolucionando';
+  render();
+}
+
+function clearAll() {
+  cur.fill(0); age.fill(0); gen = 0; prevPop = []; stateText = '—';
+  setRunning(false); render();
+}
+
+// ---------- Three.js ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0e14);
+scene.fog = new THREE.Fog(0x0b0e14, 40, 140);
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 500);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.autoRotate = true; controls.autoRotateSpeed = 1.0;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const dl = new THREE.DirectionalLight(0xffffff, 1.6); dl.position.set(1, 2, 1.5); scene.add(dl);
+const dl2 = new THREE.DirectionalLight(0x6688ff, 0.7); dl2.position.set(-2, -1, -1); scene.add(dl2);
+
+let mesh, box;
+const geo = new THREE.BoxGeometry(0.92, 0.92, 0.92);
+const mat = new THREE.MeshStandardMaterial({ roughness: 0.45, metalness: 0.1 });
+
+function buildMesh() {
+  if (mesh) { scene.remove(mesh); mesh.dispose(); }
+  mesh = new THREE.InstancedMesh(geo, mat, N * N * N);
+  mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(N * N * N * 3), 3);
+  mesh.count = 0;
+  mesh.frustumCulled = false;
+  scene.add(mesh);
+}
+function buildBox() {
+  if (box) { scene.remove(box); box.geometry.dispose(); }
+  box = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(N, N, N)),
+    new THREE.LineBasicMaterial({ color: 0x3a4766 }));
+  scene.add(box);
+  const d = N * 1.6;
+  camera.position.set(d, d * 0.7, d);
+  controls.target.set(0, 0, 0);
+  camera.far = d * 10; camera.updateProjectionMatrix();
+  scene.fog.near = d * 0.8; scene.fog.far = d * 3.5;
+}
+
+const m4 = new THREE.Matrix4(), col = new THREE.Color();
+function render(popOverride) {
+  const o = (N - 1) / 2;
+  const sliceOn = $('slice').checked, sliceY = +$('sliceY').value;
+  const mode = $('color').value;
+  let k = 0, pop = 0;
+  for (let z = 0; z < N; z++) for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const i = x + N * (y + N * z);
+    if (!cur[i]) continue;
+    pop++;
+    if (sliceOn && y > sliceY) continue;
+    m4.makeTranslation(x - o, y - o, z - o);
+    mesh.setMatrixAt(k, m4);
+    if (mode === 'age') {
+      const t = Math.min(age[i] / 40, 1);
+      col.setHSL(0.52 - 0.52 * t, 0.85, 0.55);
+    } else if (mode === 'pos') {
+      col.setRGB(0.25 + 0.75 * x / N, 0.25 + 0.75 * y / N, 0.25 + 0.75 * z / N);
+    } else {
+      col.setHSL(0.75 - 0.75 * Math.min(neighCount[i] / 26, 1), 0.85, 0.55);
+    }
+    mesh.setColorAt(k, col);
+    k++;
+  }
+  mesh.count = k;
+  mesh.instanceMatrix.needsUpdate = true;
+  mesh.instanceColor.needsUpdate = true;
+  $('gen').textContent = gen;
+  $('pop').textContent = pop;
+  $('state').textContent = stateText;
+}
+
+// ---------- UI ----------
+function setRunning(v) { running = v; $('play').textContent = v ? '⏸ Pausa' : '▶ Play'; }
+function applyRules() { surviveR = parseRule($('survive').value); birthR = parseRule($('birth').value); }
+
+$('play').onclick = () => setRunning(!running);
+$('step').onclick = () => { setRunning(false); step(); };
+$('random').onclick = randomize;
+$('clear').onclick = clearAll;
+$('preset').onchange = e => {
+  const p = PRESETS[e.target.value]; if (!p) return;
+  $('survive').value = p.s; $('birth').value = p.b;
+  $('dens').value = p.d; $('reg').value = p.r;
+  $('densV').textContent = p.d; $('regV').textContent = p.r;
+  applyRules(); randomize();
+};
+for (const id of ['survive', 'birth']) $(id).oninput = () => { $('preset').value = 'Personalizado'; applyRules(); };
+$('size').oninput = e => { $('sizeV').textContent = e.target.value; N = +e.target.value; $('sliceY').max = N; $('sliceY').value = N; alloc(); randomize(); };
+$('dens').oninput = e => $('densV').textContent = e.target.value;
+$('reg').oninput = e => $('regV').textContent = e.target.value;
+$('speed').oninput = e => $('speedV').textContent = e.target.value;
+$('color').onchange = () => render();
+$('wrap').onchange = e => wrap = e.target.checked;
+$('rotate').onchange = e => controls.autoRotate = e.target.checked;
+$('slice').onchange = e => { $('sliceY').disabled = !e.target.checked; render(); };
+$('sliceY').oninput = () => render();
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' && e.target.type === 'text') return;
+  if (e.code === 'Space') { e.preventDefault(); setRunning(!running); }
+  else if (e.key === 's' || e.key === 'S') { setRunning(false); step(); }
+  else if (e.key === 'r' || e.key === 'R') randomize();
+});
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- Loop ----------
+const clock = new THREE.Clock();
+function loop() {
+  requestAnimationFrame(loop);
+  const dt = Math.min(clock.getDelta(), 0.25);
+  if (running) {
+    acc += dt;
+    const period = 1 / +$('speed').value;
+    let guard = 0;
+    while (acc >= period && guard++ < 3) { acc -= period; step(); }
+    if (acc > period) acc = 0;
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+$('sliceY').max = N; $('sliceY').value = N;
+alloc(); randomize(); loop();
+</script>
+</body>
+</html>
